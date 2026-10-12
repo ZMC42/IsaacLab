@@ -21,6 +21,33 @@ still use `uv run --no-sync`. Child output remains in `train.log` and `simulatio
 See the Chinese [RL pipeline learning guide](../../../docs/RL_PIPELINE_GUIDE.md) for the theory,
 code map, breakpoint walkthrough, tensor shapes and checkpoint workflow.
 
+## Viser on a headless SSH server
+
+Pass `--viser` to this runner's launcher to view the live Franka scene in your local browser.
+PhysX still runs the simulator; Viser consumes its scene
+data without opening a desktop window. Install the optional viewer in the Isaac Lab environment
+while retaining existing packages, then launch:
+
+```bash
+uv sync --inexact --extra viser
+uv run --no-sync python -m scripts.reinforcement_learning.gr00t_skrl.launch \
+  --viser --timesteps 8 --rollouts 2 --rpc_timeout 7200
+```
+
+In VS Code Remote SSH, forward **8080** in the **Ports** panel and open
+`http://localhost:8080` on your local machine. Use `--viser_port PORT` to select a different
+server port. For models outside the default sibling layout, pass `--model_path`,
+`--backbone_path` and `--model_project` as documented below. Add `--viser` to a VS Code launch
+configuration's `args` to visualize a debugging session too.
+
+The viewer keeps rendering while waiting for the model without advancing physics. During model
+loading, inference, PPO optimization and checkpoint writing, the robot can remain stationary.
+The table and wrist RGB cameras remain the model's observations; the Viser canvas shows the 3D
+scene rather than a camera stream. Pausing simulation
+in the viewer also blocks the model's next simulation RPC; keep `--rpc_timeout` long enough
+for an interactive pause. The viewer closes when the run exits. Each two-step PPO update
+writes a checkpoint of approximately 9.1 GiB with the default rollout settings.
+
 ## Installation
 
 Run from the Isaac Lab checkout. The existing environments are `.venv` and `../Isaac-GR00T/.venv`. Preserve the existing model dependencies when adding skrl:

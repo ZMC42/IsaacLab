@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import select
 import socket
+import time
 import traceback
 from contextlib import suppress
 from pathlib import Path
@@ -18,6 +20,7 @@ from typing import TYPE_CHECKING
 import gymnasium as gym
 import numpy as np
 import torch
+from isaaclab_visualizers.viser import ViserVisualizerCfg
 
 from isaaclab.app import launch_simulation
 from isaaclab.envs import mdp
@@ -86,6 +89,24 @@ def observation_packet(observations: dict) -> Observation:
     return packet
 
 
+def wait_for_model(env: ManagerBasedRLEnv, connection: socket.socket, timeout: float) -> None:
+    """Render while waiting for model socket activity without advancing physics.
+
+    Args:
+        env: Simulator environment owning the viewer.
+        connection: Listening server or connected model socket.
+        timeout: Maximum wait duration [s].
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("Timed out waiting for the model socket")
+        if select.select([connection], [], [], min(0.05, remaining))[0]:
+            return
+        env.sim.render()
+
+
 def serve(cfg: RunConfig) -> None:
     """Launch the native task, serve reset/step commands and close on any peer failure."""
     env_cfg = parse_env_cfg(cfg.task, device="cuda:0", num_envs=1, overrides=["physics=isaacsim_physx"])
@@ -97,22 +118,41 @@ def serve(cfg: RunConfig) -> None:
         env_cfg.episode_length_s = cfg.episode_steps * env_cfg.decimation * env_cfg.sim.dt
     for camera in (env_cfg.scene.table_cam, env_cfg.scene.wrist_cam):
         camera.data_types = ["rgb"]
+    if cfg.viser:
+        env_cfg.sim.visualizer_cfgs = [
+            ViserVisualizerCfg(
+                port=cfg.viser_port,
+                open_browser=False,
+                eye=(1.5, -1.5, 1.2),
+                lookat=(0.45, 0.0, 0.25),
+            )
+        ]
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     server.settimeout(cfg.rpc_timeout)
     rpc = None
     try:
         with launch_simulation(
-            env_cfg, {"headless": True, "visualizer": None, "visualizer_explicit": True, "enable_cameras": True}
+            env_cfg,
+            {
+                "headless": True,
+                "visualizer": ["viser"] if cfg.viser else None,
+                "visualizer_explicit": True,
+                "enable_cameras": True,
+            },
         ):
             env = gym.make(cfg.task, cfg=env_cfg).unwrapped
             try:
                 server.bind(cfg.socket_path)
                 server.listen(1)
                 print("Simulation ready", flush=True)
+                if cfg.viser:
+                    wait_for_model(env, server, cfg.rpc_timeout)
                 connection, _ = server.accept()
                 rpc = RpcConnection(connection, cfg.rpc_timeout)
                 previous_state = None
                 while True:
+                    if cfg.viser:
+                        wait_for_model(env, connection, cfg.rpc_timeout)
                     request = rpc.receive()
                     if not isinstance(request, Request):
                         raise ValueError("Invalid RPC request")

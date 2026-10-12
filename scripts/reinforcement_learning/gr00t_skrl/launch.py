@@ -64,6 +64,8 @@ def main() -> None:
     parser.add_argument("--max_tokens", type=int, default=1024)
     parser.add_argument("--episode_steps", type=int)
     parser.add_argument("--rpc_timeout", type=float, default=300)
+    parser.add_argument("--viser", action="store_true", help="Visualize the headless simulator in a Viser web viewer")
+    parser.add_argument("--viser_port", type=int, default=8080, help="Viser web server port (default: 8080)")
     parser.add_argument(
         "--debug_subprocesses",
         action="store_true",
@@ -141,6 +143,8 @@ def main() -> None:
                 )
                 processes.append(process)
             print(f"Run directory: {run_dir}", flush=True)
+            if cfg.viser:
+                print(f"Viser viewer: http://localhost:{cfg.viser_port} (forward this port over SSH)", flush=True)
             while processes[1].poll() is None:
                 if time.monotonic() >= next_sample_time:
                     query = subprocess.run(

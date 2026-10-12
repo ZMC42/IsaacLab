@@ -39,6 +39,8 @@ class RunConfig:
     mode: Literal["train", "inference"] = "train"
     rpc_timeout: float = 300.0
     instruction: str = "Stack the red cube on the blue cube, then stack the green cube on the red cube."
+    viser: bool = False
+    viser_port: int = 8080
 
     def validate(self) -> None:
         """Reject invalid configurations before starting either process."""
@@ -52,6 +54,8 @@ class RunConfig:
             raise ValueError("learning_rate must be finite and positive")
         if self.rpc_timeout <= 0 or self.episode_steps is not None and self.episode_steps < 1:
             raise ValueError("Timeout and episode length must be positive")
+        if not 1 <= self.viser_port <= 65535:
+            raise ValueError("Viser port must be between 1 and 65535")
         if "nvidia/Cosmos-Reason2" not in self.backbone_path:
             raise ValueError("Keep the nvidia/Cosmos-Reason2 substring in the backbone path")
 
