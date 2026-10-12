@@ -38,6 +38,8 @@ logger = logging.getLogger(__name__)
 
 
 if TYPE_CHECKING:
+    import trimesh
+
     from isaaclab.scene_data import SceneDataProvider
 
 
@@ -185,6 +187,19 @@ class NewtonViewerViser(ViewerViser):
         # Do NOT remove _live_plots_folder — it is a persistent structural element
         # created once in _setup_isaaclab_sidebar and should survive model reloads.
         # Only the per-term chart handles (in _per_plot_folders) are cleared above.
+
+    @staticmethod
+    def _build_trimesh_mesh(
+        points: np.ndarray, indices: np.ndarray, uvs: np.ndarray, texture: np.ndarray
+    ) -> trimesh.Trimesh | None:
+        """Export color textures as dielectric materials for Viser's browser renderer."""
+        mesh = ViewerViser._build_trimesh_mesh(points, indices, uvs, texture)
+        if mesh is not None:
+            material = mesh.visual.material.to_pbr()
+            # SimpleMaterial omits metallicFactor; glTF defaults it to fully metallic.
+            material.metallicFactor = 0.0
+            mesh.visual.material = material
+        return mesh
 
     @staticmethod
     def _array_signature(array) -> tuple[tuple[int, ...], bytes] | None:

@@ -893,9 +893,10 @@ uses a fixed sky-gradient and single directional light color
 ``sky_lower_color``, ``light_color``), independent of scene USD lights. Newton RTX supports
 only 3 lighting-environment presets
 (:attr:`~isaaclab_visualizers.newton.NewtonRTXVisualizerCfg.rtx_environment`: ``"default"``,
-``"studio"``, ``"none"``) and does not use any scene-authored USD lights. Viser uses a single
-ambient light with no directional key light, so scenes tend to look darker and flatter than
-the other backends. Rerun uses fixed built-in viewer shading with no scene-driven lighting.
+``"studio"``, ``"none"``) and does not use any scene-authored USD lights. Viser uses the browser's
+default directional lights plus an ambient light, without scene-authored USD lights or an HDR
+environment map. Color textures are exported with non-metallic materials. Rerun uses fixed
+built-in viewer shading with no scene-driven lighting.
 
 **Kit: incompatible with ovphysx / ovrtx presets**
 
