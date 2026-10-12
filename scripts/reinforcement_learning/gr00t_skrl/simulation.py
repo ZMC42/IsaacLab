@@ -110,6 +110,7 @@ def wait_for_model(env: ManagerBasedRLEnv, connection: socket.socket, timeout: f
 def serve(cfg: RunConfig) -> None:
     """Launch the native task, serve reset/step commands and close on any peer failure."""
     env_cfg = parse_env_cfg(cfg.task, device="cuda:0", num_envs=1, overrides=["physics=isaacsim_physx"])
+    env_cfg.scene.plane.spawn.visible = True
     env_cfg.seed = cfg.seed
     env_cfg.events = LocalEvents()
     env_cfg.rewards = LocalRewards()
