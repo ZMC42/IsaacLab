@@ -3,7 +3,7 @@
 #
 # SPDX-License-Identifier: BSD-3-Clause
 
-"""Thin two-environment launcher; training interaction stays in skrl SequentialTrainer."""
+"""Two-process launcher for vector simulation; interaction stays in skrl SequentialTrainer."""
 
 from __future__ import annotations
 
@@ -54,7 +54,15 @@ def main() -> None:
     parser.add_argument("--run_dir")
     parser.add_argument("--mode", choices=("train", "inference"), default="train")
     parser.add_argument("--resume")
-    parser.add_argument("--timesteps", type=int, default=2)
+    parser.add_argument(
+        "--timesteps", type=int, default=2, help="Synchronous steps; collects timesteps * num_envs samples"
+    )
+    parser.add_argument(
+        "--num-envs", "--num_envs", dest="num_envs", type=int, default=1, help="Physical environment count"
+    )
+    parser.add_argument("--encoder_batch_size", type=int, default=1, help="Maximum frozen-backbone encoding batch")
+    parser.add_argument("--sampling_batch_size", type=int, default=1, help="Maximum action-generation/diagnostic batch")
+    parser.add_argument("--training_batch_size", type=int, default=1, help="Maximum native PPO minibatch")
     parser.add_argument("--rollouts", type=int, default=2)
     parser.add_argument("--learning_epochs", type=int, default=2)
     parser.add_argument("--generation_steps", type=int, default=2)

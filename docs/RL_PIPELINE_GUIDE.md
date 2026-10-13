@@ -136,7 +136,7 @@ flowchart TB
 
 | 参数 / 概念 | 值 | 含义 |
 | --- | --- | --- |
-| `num_envs` | 1 | 一个 Franka 仿真环境，当前 wrapper 固定如此 |
+| `num_envs` | 1 | 默认一个 Franka；可用 `--num-envs N` 创建 N 个并行环境 |
 | `timesteps` | 2 | 本次 trainer 执行两次环境控制 |
 | `rollouts` | 2 | 每收集两条 transition 做一轮 PPO update |
 | `episode_steps` | 2 | 最迟两次控制后 timeout，用来观察 reset 和 bootstrap |
@@ -148,9 +148,27 @@ flowchart TB
 | `mini_batches` | 2 | 每轮拆成两个 minibatch，每批一个 transition |
 | native Adam step | 4 | 2 epochs × 2 minibatches，每批一次更新 |
 
-这里没有“五次 backward 累积成一次 update”的设置。**一次 rollout update 内有四次 `optimizer.step()`**。`RunState.updates` 计 rollout update 次数，`optimizer_steps` 计 Adam 次数，`environment_steps` 计交互次数。
+这里没有“五次 backward 累积成一次 update”的设置。**默认单环境一次 rollout update 内有四次 `optimizer.step()`**。`RunState.updates` 计 rollout update 次数，`optimizer_steps` 计 Adam 次数，`environment_steps` 计同步交互次数，`transitions` 计所有环境累计采集的样本数。
 
 当前任务的 `sim.dt=0.01 s`、`decimation=5`，所以每个环境控制步对应五个物理积分步，`step_dt=0.05 s`。两步只覆盖约 0.1 秒仿真时间；模型加载和训练的真实耗时不算仿真时间。
+
+### 3.3 扩展到多个并行环境
+
+单个仿真进程运行 N 个环境，所有环境共享同一个模型和 PPO agent。
+`--timesteps T` 表示同步推进 T 次，总采样量为 `T × N`；`--rollouts R`
+表示每个环境采集 R 步后更新，每次更新使用 `R × N` 个样本。
+
+编码、动作采样和训练分别由 `--encoder_batch_size`、`--sampling_batch_size`、
+`--training_batch_size` 限制批大小，默认均为 1。训练每轮拆成
+`ceil(R × N / training_batch_size)` 个 minibatch；尾部样本也参与学习。
+例如 N=2、T=4、R=2、两轮学习、训练批大小 1：采集 8 条样本、2 次 PPO update、16 次 Adam step。
+
+memory 保存 `[R, N, ...]`，GAE 沿时间维递推，各环境用自己的终止标志切断 episode。
+Isaac Lab 只重置结束的环境，其他机器人继续运行。确定性初始场景保持不变，动作噪声独立采样。
+
+小批次限制模型计算时的激活显存，但 GPU 特征缓存仍随 `R × N` 增长，默认每条约 8 MiB；
+随机采样产生的数据副本和相机渲染也占显存。先从 N=2 验证，再实测显存与吞吐量。
+运行命令和恢复规则见 [runner README 的并行训练说明](../scripts/reinforcement_learning/gr00t_skrl/README.md#parallel-environment-training)。
 
 ## 4. 第一站：从 SFT 初始化到可训练模型
 
@@ -185,11 +203,11 @@ head 用 BF16 节省显存，生成链、概率和 PPO 计算使用 FP32。局�
 
 ```text
 state = [末端 x, y, z, 旋转向量 rx, ry, rz, 两个手指的关节位置]
-shape = (8,)
+shape = (N, 8)，默认 N=1
 单位 = [m, m, m, rad, rad, rad, m, m]
 ```
 
-当前双相机为 200×200 RGB，传输 dtype 是 `uint8`。`critic_state()` 使用 `axis_angle_from_quat(quat_unique(...))` 得到主值旋转向量。processor 的字段仍叫 `roll/pitch/yaw`，但此处存放的是**旋转向量的三个分量**，不能按欧拉角解释。第二手指的符号沿用任务与 micro-SFT 统计，不取绝对值。
+当前双相机为 200×200 RGB，每路传输 shape 是 `(N,200,200,3)`，dtype 是 `uint8`。`critic_state()` 使用 `axis_angle_from_quat(quat_unique(...))` 得到主值旋转向量。processor 的字段仍叫 `roll/pitch/yaw`，但此处存放的是**旋转向量的三个分量**，不能按欧拉角解释。第二手指的符号沿用任务与 micro-SFT 统计，不取绝对值。
 
 `FrozenEncoder.encode()` 将两张图、state 和固定语言指令组装成 `VLAStepData`，使用 `libero_sim` embodiment 选择已有 processor 的数据契约。这个 tag 不表示实际仿真由 LIBERO 运行；实际环境是 Isaac Lab。
 
@@ -230,6 +248,7 @@ PPO 保存 `x₀…x₂`，因此一个样本的 chain 是 `(1,3,40,132)`，展�
 
 ```text
 command = [Δx, Δy, Δz, Δrx, Δry, Δrz, gripper]
+批量 command.shape = (N, 7)
 ```
 
 前六维裁剪到 `[-0.1,0.1]`，夹爪变为 `+1` 或 `-1`。平移和旋转增量分别按 `[m]` 和 `[rad]` 理解；夹爪是开闭标志。命令发给任务的 relative differential IK action，任务内部 `scale=0.5`；runner 没有再乘一次 0.5。它不是直接给七个 Franka 关节各发一个角度。
@@ -440,7 +459,9 @@ logs/gr00t_skrl/<本次目录>/
 
 checkpoint 包含 `policy`、`value`、`optimizer` 和 `run_state`。`run_state` 保存累计计数、RNG、依赖和 processor 指纹、生成链契约等。它不包含 frozen backbone，不是能直接交给 HF `from_pretrained()` 的完整模型目录。
 
-恢复仍依赖 micro-SFT config/processor、当前 GR00T 代码和本地 Cosmos 权重。兼容性 metadata 采用严格比较，其中还包含模型路径、生成步数、sigma、学习率和 rollout 配置等。移动资产或修改这些设置后，当前恢复会拒绝不匹配的 checkpoint；processor 能处理旧 backbone 内嵌路径，不代表 PPO metadata 可以随意改变。
+恢复仍依赖 micro-SFT config/processor、当前 GR00T 代码和本地 Cosmos 权重。兼容性 metadata 包含模型路径、生成步数、sigma、学习率、rollout 配置和训练批大小等。移动资产或修改这些设置后，恢复会拒绝不匹配的 checkpoint；processor 能处理旧 backbone 内嵌路径，不代表 PPO metadata 可以随意改变。
+
+恢复允许改变 `num_envs`、编码批大小和采样批大小。旧单环境 checkpoint 缺少训练批大小时按 1 校验，缺少 `transitions` 时按历史 `environment_steps` 推导；后续每次交互增加 N 条样本。仿真从新 episode 开始，改变并行数或分批方式不保证采样轨迹一致。
 
 ### 10.2 在 VS Code 中恢复或推理
 

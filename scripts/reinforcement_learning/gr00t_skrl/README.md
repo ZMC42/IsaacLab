@@ -2,7 +2,78 @@
 
 This local runner fine-tunes the **complete original N1.7 action head** from the existing micro-SFT checkpoint. It uses skrl 2.1.0 PyTorch `PPO`, `RandomMemory` and `SequentialTrainer` for rollout collection, GAE, losses, backward passes, Adam updates, TensorBoard and checkpoint serialization. The frozen vision/language backbone is held separately from the policy, optimizer and checkpoint.
 
-The simulator and model run in separate uv environments and processes. The simulator uses Isaac Sim 6.1 / PhysX, one Franka and the task's table/wrist RGB cameras. This is an engineering smoke test with a local approach reward; it does not establish stacking ability or PPO convergence. Shared task definitions and Isaac-GR00T source are unchanged.
+The simulator and model run in separate uv environments and processes on one GPU. The simulator uses Isaac Sim 6.1 / PhysX, one Franka per environment and the task's table/wrist RGB cameras. This is an engineering smoke test with a local approach reward; it does not establish stacking ability or PPO convergence. Shared task definitions and Isaac-GR00T source are unchanged.
+
+## Parallel environment training
+
+Pass `--num-envs N` (alias `--num_envs`) to create N environments in the existing simulation
+process. One model and one PPO agent control all environments. Every step encodes their
+observations, samples independent full generation chains, decodes each with its own physical
+reference state, and advances all robots together. Deterministic resets are preserved; each
+environment resets independently on termination or timeout.
+
+```bash
+uv run --no-sync python -m scripts.reinforcement_learning.gr00t_skrl.launch \
+  --num-envs 2 --timesteps 4 --rollouts 2 --episode_steps 2 \
+  --encoder_batch_size 1 --sampling_batch_size 1 --training_batch_size 1
+```
+
+| Option | Default | Meaning |
+| --- | --- | --- |
+| `--num-envs` | 1 | Number of physical environments |
+| `--encoder_batch_size` | 1 | Maximum frozen-backbone encoding batch |
+| `--sampling_batch_size` | 1 | Maximum action-generation and likelihood-diagnostic batch |
+| `--training_batch_size` | 1 | Maximum native PPO minibatch |
+| `--timesteps` | 2 | Synchronous steps in this invocation; collects `timesteps × N` transitions |
+| `--rollouts` | 2 | Steps per environment before each update; memory holds `rollouts × N` samples |
+
+Training uses `ceil(rollouts × N / training_batch_size)` native minibatches per epoch.
+Uneven batches cover every sample without replacement. There is no gradient accumulation;
+increasing N at a fixed batch size increases optimizer steps per update. The example above
+collects eight transitions, runs two PPO updates and, with two learning epochs, takes 16 Adam
+steps. Learning rate and probability semantics are unchanged.
+
+RPC images are `[N, height, width, 3]`, state and terminal state are `[N, 8]`, controls are
+`[N, 7]`, and skrl reward/done tensors are `[N, 1]`. Native memory retains `[rollouts, N, ...]`
+until PPO samples minibatches. Timeout bootstrap uses only that environment's pre-reset state;
+true termination takes precedence over timeout. The single-environment trainer reset request
+is still consumed without resetting the simulation again.
+
+All batch sizes default to one to limit activation memory. GPU rollout storage still grows with
+`rollouts × N`: each padded FP32 observation is about 8 MiB for the default 1024 tokens and
+2048-dimensional backbone. Native randomized minibatches also allocate sampled tensor copies.
+Rendering memory grows with the number of camera views. Start with N=2 and measure before raising
+N or any batch size. Logs report the observation-storage estimate; `metrics.json` records
+per-environment commands, motion, rewards and camera variation, total `transitions_count`,
+`transitions_per_second` (including updates/checkpoint writes, excluding initialization), and
+model memory peaks. `processes.json` records sampled whole-GPU memory.
+
+`RunState.environment_steps`, TensorBoard's step axis and checkpoint names continue to count
+synchronous steps. The new cumulative `RunState.transitions` counts physical transitions even
+when N changes after resuming. A legacy single-environment checkpoint defaults its missing
+transition counter to `environment_steps` and its missing training batch size to one. Resume
+allows changing N and encoder/sampling batch sizes; model/processor/probability and PPO settings,
+including training batch size, must match. Physics starts from a fresh episode, so changing N or
+batching does not promise the same sampled trajectory. Use `--resume PATH` with the same model
+asset paths recorded by the original run. `--mode inference --resume PATH --num-envs N` also
+supports parallel inference without optimizer updates.
+
+The following two-step runs passed on an RTX 4090 (24 GB) on 2026-10-13, with all three batch
+sizes set to one, two learning epochs and a checkpoint write:
+
+| Run | New transitions | New Adam steps | Sampled whole-GPU peak | Transitions/s |
+| --- | ---: | ---: | ---: | ---: |
+| N=1, fresh | 2 | 4 | 20,796 MiB | 0.127 |
+| N=2, resumed from legacy N=1 | 4 | 8 | 21,174 MiB | 0.246 |
+| N=4, fresh | 8 | 16 | 21,232 MiB | 0.426 |
+
+All robots moved, all camera views varied, likelihood recomputation error was zero, gradients
+were finite, and frozen-backbone fingerprints matched. The real partial-reset test also passed.
+These short engineering runs include checkpoint I/O and use different rollout sizes and starting
+weights; the rates do not establish sustained-training speedup or convergence.
+Restoring the N=4 checkpoint into N=2 inference with encoder/sampling batch sizes of two also
+passed: four new transitions were collected, likelihood recomputation error was zero, and the
+optimizer stayed at step 16.
 
 ## Debugging and learning
 
@@ -165,7 +236,7 @@ Each environment step predicts a new chain, decodes `x_K` using the original pro
 
 The local native reset event restores initial scene states and joint targets, disabling randomization only in this runner. The local reward is `step_dt * (1 - tanh(distance_to_red_cube / 0.1))`, using actual scene geometry; native reward-manager integration supplies `step_dt`. Task success, failure and timeout terms are inherited.
 
-The state critic is `[8, 64, 1]`. With `compute_final_obs=True`, a timeout passes the reset-before-terminal critic state to native PPO bootstrapping. Simultaneous true termination and timeout does not bootstrap. The next interaction uses normal reset-after-terminal observations. The wrapper consumes the native trainer's single-environment reset request without resetting the already-reset simulation a second time.
+The state critic is `[8, 64, 1]`. With `compute_final_obs=True`, each timeout passes its reset-before-terminal critic state to native PPO bootstrapping. Simultaneous true termination and timeout does not bootstrap. The next interaction uses normal reset-after-terminal observations. The wrapper consumes the native trainer's single-environment reset request without resetting the already-reset simulation a second time.
 
 ## Training, checkpoint and inference
 
@@ -219,4 +290,15 @@ NO_ALBUMENTATIONS_UPDATE=1 uv run --project ../Isaac-GR00T --no-sync python -m p
   --confcutdir=scripts/reinforcement_learning/gr00t_skrl/tests
 ```
 
-Coverage also checks real NumPy 2.x ↔ 1.26 RPC compatibility, EOF and read deadlines. Coverage protects full-chain probability/memory, original-head gradient and dropout behavior, independently calculated timeout returns, and new-process restoration of model/optimizer/RNG/counters. Changing probability `sum` to `mean` or using reset state for timeout bootstrap makes the corresponding test fail. No native PPO/GAE implementation is copied.
+Coverage also checks real batched NumPy 2.x ↔ 1.26 RPC compatibility, EOF and read deadlines.
+Coverage protects full-chain probability/memory, original-head gradient and dropout behavior,
+encoding batch order and tail batches, per-environment reference-state decoding, partial auto-reset,
+independently calculated multi-environment timeout returns, complete uneven minibatch sampling,
+legacy single-environment checkpoint migration and new-process restoration of model/optimizer/RNG/counters.
+Changing probability `sum` to `mean` or using reset state for timeout bootstrap makes the
+corresponding test fail. No native PPO/GAE implementation is copied.
+
+To additionally verify partial resets in a real two-environment PhysX scene with both RGB camera
+views per robot, set `GR00T_SIM_TESTS=1` on the same pytest command. This opt-in test launches Kit
+only in a simulator-environment child process and requires the task's USD assets. Run it when the
+GPU is free; the parent remains in the model environment.

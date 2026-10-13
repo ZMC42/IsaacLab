@@ -12,6 +12,7 @@ import hashlib
 import json
 import random
 import resource
+import time
 from importlib.metadata import version
 from pathlib import Path
 
@@ -59,6 +60,7 @@ def checkpoint_metadata(cfg: RunConfig, encoder: FrozenEncoder) -> dict:
         "learning_rate": cfg.learning_rate,
         "rollouts": cfg.rollouts,
         "learning_epochs": cfg.learning_epochs,
+        "training_batch_size": cfg.training_batch_size,
         "gamma": 0.99,
         "gae_lambda": 0.95,
         "ratio_clip": 0.2,
@@ -73,7 +75,14 @@ def run(cfg: RunConfig) -> None:
     torch.manual_seed(cfg.seed)
     torch.cuda.reset_peak_memory_stats()
     encoder = FrozenEncoder(cfg)
-    policy = ChainPolicy(encoder.head, encoder.layout, cfg.generation_steps, cfg.sigma, "cuda:0")
+    policy = ChainPolicy(
+        encoder.head,
+        encoder.layout,
+        cfg.generation_steps,
+        cfg.sigma,
+        "cuda:0",
+        sampling_batch_size=cfg.sampling_batch_size,
+    )
     if not all(parameter.requires_grad for parameter in policy.parameters()):
         raise RuntimeError("The complete original action head must remain trainable")
     critic = StateCritic(policy.observation_space, policy.action_space, "cuda:0")
@@ -83,7 +92,7 @@ def run(cfg: RunConfig) -> None:
     agent_cfg = PPO_CFG(
         rollouts=cfg.rollouts,
         learning_epochs=cfg.learning_epochs,
-        mini_batches=cfg.rollouts,
+        mini_batches=cfg.mini_batches,
         discount_factor=0.99,
         gae_lambda=0.95,
         learning_rate=cfg.learning_rate,
@@ -97,10 +106,11 @@ def run(cfg: RunConfig) -> None:
             directory=cfg.run_dir, experiment_name="native", write_interval=cfg.rollouts, checkpoint_interval=0
         ),
     )
-    memory = RandomMemory(memory_size=cfg.rollouts, num_envs=1, device="cuda:0")
+    memory = RandomMemory(memory_size=cfg.rollouts, num_envs=cfg.num_envs, device="cuda:0")
     agent = Gr00tPPO(
         encoder=encoder,
         run_state=run_state,
+        diagnostic_batch_size=cfg.sampling_batch_size,
         models={"policy": policy, "value": critic},
         memory=memory,
         observation_space=policy.observation_space,
@@ -125,10 +135,12 @@ def run(cfg: RunConfig) -> None:
         resume_summary = agent.resume(cfg.resume) if cfg.resume else None
         # Verify the real model and native memory interface before any parameter updates.
         observations, _ = env.reset()
+        consistency = 0.0
         with torch.no_grad():
-            chain, output = policy.act({"observations": observations})
-            _, recomputed = policy.act({"observations": observations, "taken_actions": chain})
-        consistency = float((output["log_prob"] - recomputed["log_prob"]).abs().max())
+            for batch in observations.split(cfg.sampling_batch_size):
+                chain, output = policy.act({"observations": batch})
+                _, recomputed = policy.act({"observations": batch, "taken_actions": chain})
+                consistency = max(consistency, float((output["log_prob"] - recomputed["log_prob"]).abs().max()))
         if consistency > 0.01:
             raise RuntimeError(f"Sampling/recompute likelihood mismatch: {consistency}")
         sampling_peak = torch.cuda.max_memory_allocated() / 2**30
@@ -141,6 +153,10 @@ def run(cfg: RunConfig) -> None:
                         p.numel() for p in encoder.backbone.parameters() if p.requires_grad
                     ),
                     "chain_size": policy.num_actions,
+                    "num_envs": cfg.num_envs,
+                    "rollout_samples": cfg.rollouts * cfg.num_envs,
+                    "mini_batches": cfg.mini_batches,
+                    "observation_memory_gib": cfg.rollouts * cfg.num_envs * encoder.layout.size * 4 / 2**30,
                     "log_prob_recompute_error": consistency,
                     "resume": resume_summary,
                 }
@@ -150,10 +166,12 @@ def run(cfg: RunConfig) -> None:
         if resume_summary is not None:
             # The diagnostic above consumed RNG; restore again immediately before native trainer interaction.
             run_state.restore_rng()
+        start_time = time.monotonic()
         if cfg.mode == "train":
             trainer.train()
         else:
             trainer.eval()
+        interaction_seconds = time.monotonic() - start_time
         backbone_unchanged = module_digest(encoder.backbone) == backbone_before
         if not backbone_unchanged or any(p.grad is not None for p in encoder.backbone.parameters()):
             raise RuntimeError("Frozen backbone changed or received gradients")
@@ -170,10 +188,16 @@ def run(cfg: RunConfig) -> None:
             "updates": agent.diagnostics,
             "transitions": env.metrics,
             "environment_steps": run_state.environment_steps,
+            "transitions_count": run_state.transitions,
+            "num_envs": cfg.num_envs,
+            "interaction_seconds": interaction_seconds,
+            "transitions_per_second": cfg.timesteps * cfg.num_envs / interaction_seconds,
+            "observation_memory_gib": cfg.rollouts * cfg.num_envs * encoder.layout.size * 4 / 2**30,
             "optimizer_steps": run_state.optimizer_steps,
         }
-        if not any(item["motion_m"] > 1e-6 for item in env.metrics):
-            raise RuntimeError("No measured robot motion during real simulation")
+        for env_id in range(cfg.num_envs):
+            if not any(item["motion_m"] > 1e-6 for item in env.metrics if item["env_id"] == env_id):
+                raise RuntimeError(f"No measured robot motion in environment {env_id}")
         if not all(item["table_rgb_std"] > 1 and item["wrist_rgb_std"] > 1 for item in env.metrics):
             raise RuntimeError("Invalid or constant RGB camera observations")
         (Path(cfg.run_dir) / "metrics.json").write_text(json.dumps(metrics, indent=2))
@@ -181,6 +205,7 @@ def run(cfg: RunConfig) -> None:
             json.dumps(
                 {
                     "environment_steps": run_state.environment_steps,
+                    "transitions": run_state.transitions,
                     "optimizer_steps": run_state.optimizer_steps,
                     "backbone_unchanged": backbone_unchanged,
                 }

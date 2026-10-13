@@ -20,7 +20,7 @@ from .protocol import Request, RpcConnection, RunConfig, Transition
 
 
 class RemoteEnvironment(Wrapper):
-    """Single auto-reset environment with frozen-feature observations and state-only critic inputs."""
+    """Vector auto-reset environment with frozen features and state-only critic inputs."""
 
     def __init__(self, cfg: RunConfig, encoder: FrozenEncoder, policy: ChainPolicy):
         # The remote interface itself owns the skrl spaces; no local Gym environment is built.
@@ -28,6 +28,7 @@ class RemoteEnvironment(Wrapper):
         self._observation_space = policy.observation_space
         self._action_space = policy.action_space
         self._state_space = gym.spaces.Box(-np.inf, np.inf, (8,), dtype=np.float32)
+        self._num_envs = cfg.num_envs
         self.encoder = encoder
         self.policy = policy
         self._state = None
@@ -54,8 +55,8 @@ class RemoteEnvironment(Wrapper):
 
     @property
     def num_envs(self) -> int:
-        """The runner intentionally uses one physical environment."""
-        return 1
+        """Number of independently resetting physical environments."""
+        return self._num_envs
 
     @property
     def num_agents(self) -> int:
@@ -91,10 +92,12 @@ class RemoteEnvironment(Wrapper):
 
     def step(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
         """Decode only x_K's first action; preserve final critic state independently."""
-        expected = (1, self.policy.num_actions)
+        expected = (self.num_envs, self.policy.num_actions)
         if actions.shape != expected or not torch.isfinite(actions).all():
             raise ValueError(f"Expected finite full-chain actions of shape {expected}")
-        chain = actions.reshape(1, self.policy.generation_steps + 1, self.policy.horizon, self.policy.action_dim)
+        chain = actions.reshape(
+            self.num_envs, self.policy.generation_steps + 1, self.policy.horizon, self.policy.action_dim
+        )
         command = self.encoder.decode(chain[:, -1])
         reply = self._request(Request("step", command))
         if not np.array_equal(reply.executed_action, command):
@@ -102,23 +105,27 @@ class RemoteEnvironment(Wrapper):
         next_observations = self._encode(reply)
         infos = {}
         if reply.final_state is not None:
-            if reply.final_state.shape != (8,) or not np.isfinite(reply.final_state).all():
-                raise ValueError("Invalid terminal critic state")
-            infos["final_state"] = torch.as_tensor(reply.final_state, device=self.device).reshape(1, 8)
-        self._autoreset_pending = reply.terminated or reply.truncated
-        self.metrics.append(
-            {
-                "command": command.tolist(),
-                "motion_m": reply.motion,
-                "reward": reply.reward,
-                "terminated": reply.terminated,
-                "truncated": reply.truncated,
-                "table_rgb_std": float(reply.observation.table_rgb.std()),
-                "wrist_rgb_std": float(reply.observation.wrist_rgb.std()),
-            }
-        )
+            infos["final_state"] = torch.as_tensor(reply.final_state, device=self.device)
+        # skrl requests explicit reset only for a single environment; vector envs auto-reset in Isaac Lab.
+        self._autoreset_pending = self.num_envs == 1 and bool((reply.terminated | reply.truncated).any())
+        step = len(self.metrics) // self.num_envs + 1
+        for index in range(self.num_envs):
+            self.metrics.append(
+                {
+                    "env_id": index,
+                    "environment_step": step,
+                    "command": command[index].tolist(),
+                    "motion_m": float(reply.motion[index]),
+                    "reward": float(reply.reward[index]),
+                    "terminated": bool(reply.terminated[index]),
+                    "truncated": bool(reply.truncated[index]),
+                    "table_rgb_std": float(reply.observation.table_rgb[index].std()),
+                    "wrist_rgb_std": float(reply.observation.wrist_rgb[index].std()),
+                }
+            )
         tensors = [
-            torch.tensor([[value]], device=self.device) for value in (reply.reward, reply.terminated, reply.truncated)
+            torch.tensor(value, device=self.device).reshape(self.num_envs, 1)
+            for value in (reply.reward, reply.terminated, reply.truncated)
         ]
         return next_observations, *tensors, infos
 
@@ -137,16 +144,17 @@ class RemoteEnvironment(Wrapper):
                 self.rpc.close()
 
     def _request(self, request: Request) -> Transition:
-        request.validate()
+        request.validate(self.num_envs)
         self.rpc.send(request)
         reply = self.rpc.receive()
         if isinstance(reply, str):
             raise RuntimeError(f"Simulation failed: {reply}")
-        if not isinstance(reply, Transition) or not np.isfinite(reply.reward):
+        if not isinstance(reply, Transition):
             raise ValueError("Invalid simulation reply")
+        reply.validate(self.num_envs)
         return reply
 
     def _encode(self, reply: Transition) -> torch.Tensor:
-        self._state = torch.as_tensor(reply.observation.state, device=self.device).reshape(1, 8)
+        self._state = torch.as_tensor(reply.observation.state, device=self.device)
         self._observations = self.encoder.encode(reply.observation)
         return self._observations

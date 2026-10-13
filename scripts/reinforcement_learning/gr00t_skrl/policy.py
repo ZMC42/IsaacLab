@@ -131,6 +131,7 @@ class FrozenEncoder:
             raise ValueError("This runner requires the micro-SFT single-state-history processor")
         self.device = torch.device(device)
         self.instruction = cfg.instruction
+        self.batch_size = cfg.encoder_batch_size
         self.last_states: dict[str, np.ndarray] = {}
         for transformer in (self.head.model, self.head.vl_self_attention):
             for block in transformer.transformer_blocks:
@@ -140,28 +141,38 @@ class FrozenEncoder:
     def encode(self, observation: Observation) -> torch.Tensor:
         """Process RGB/state and cache only frozen backbone outputs (no autograd graph)."""
         observation.validate()
-        self.last_states = {key: observation.state[i : i + 1].reshape(1, 1, 1) for i, key in enumerate(STATE_KEYS[:-1])}
-        self.last_states["gripper"] = observation.state[6:].reshape(1, 1, 2)
-        step = VLAStepData(
-            images={"image": observation.table_rgb[None], "wrist_image": observation.wrist_rgb[None]},
-            states={key: value[0] for key, value in self.last_states.items()},
-            actions={},
-            text=self.instruction,
-            embodiment=self.embodiment,
-        )
-        processed = self.processor([{"type": MessageType.EPISODE_STEP.value, "content": step}])
-        collated = self.processor.collator([processed])
+        self.last_states = {key: observation.state[:, None, i : i + 1].copy() for i, key in enumerate(STATE_KEYS[:-1])}
+        self.last_states["gripper"] = observation.state[:, None, 6:].copy()
+        packed = []
         with torch.no_grad():
-            backbone_input, action_input = self.model.prepare_input(collated["inputs"])
-            output = self.backbone(backbone_input)
-            return self.layout.pack(output, action_input["state"], action_input["embodiment_id"])
+            for start in range(0, observation.state.shape[0], self.batch_size):
+                processed = []
+                for index in range(start, min(start + self.batch_size, observation.state.shape[0])):
+                    step = VLAStepData(
+                        images={
+                            "image": observation.table_rgb[index][None],
+                            "wrist_image": observation.wrist_rgb[index][None],
+                        },
+                        states={key: value[index] for key, value in self.last_states.items()},
+                        actions={},
+                        text=self.instruction,
+                        embodiment=self.embodiment,
+                    )
+                    processed.append(self.processor([{"type": MessageType.EPISODE_STEP.value, "content": step}]))
+                collated = self.processor.collator(processed)
+                backbone_input, action_input = self.model.prepare_input(collated["inputs"])
+                output = self.backbone(backbone_input)
+                packed.append(self.layout.pack(output, action_input["state"], action_input["embodiment_id"]))
+        return torch.cat(packed)
 
     def decode(self, action: torch.Tensor) -> np.ndarray:
         """Decode x_K and execute the first relative IK command [m, rad] with binary gripper."""
+        if not self.last_states or action.shape[0] != self.last_states["gripper"].shape[0]:
+            raise ValueError("Actions must match the encoded environment states")
         decoded = self.processor.decode_action(action.detach().float().cpu().numpy(), self.embodiment, self.last_states)
-        command = np.array([decoded[key][0, 0, 0] for key in STATE_KEYS], dtype=np.float32)
-        command[:6] = np.clip(command[:6], -0.1, 0.1)
-        command[6] = 1.0 if command[6] > 0 else -1.0
+        command = np.stack([decoded[key][:, 0, 0] for key in STATE_KEYS], axis=-1).astype(np.float32)
+        command[:, :6] = np.clip(command[:, :6], -0.1, 0.1)
+        command[:, 6] = np.where(command[:, 6] > 0, 1.0, -1.0)
         if not np.isfinite(command).all():
             raise ValueError("Processor decoded a non-finite robot command")
         return command
@@ -180,12 +191,21 @@ class ChainPolicy(Model):
     """Full original head, with full-chain actions and teacher-forced likelihood."""
 
     def __init__(
-        self, head: Gr00tN1d7ActionHead, layout: FeatureLayout, generation_steps: int, sigma: float, device: str
+        self,
+        head: Gr00tN1d7ActionHead,
+        layout: FeatureLayout,
+        generation_steps: int,
+        sigma: float,
+        device: str,
+        sampling_batch_size: int = 1,
     ):
         self.horizon = head.config.action_horizon
         self.action_dim = head.config.max_action_dim
         self.generation_steps = generation_steps
         self.sigma = sigma
+        if sampling_batch_size < 1:
+            raise ValueError("Sampling batch size must be positive")
+        self.sampling_batch_size = sampling_batch_size
         observation_space = gym.spaces.Box(-np.inf, np.inf, (layout.size,), dtype=np.float32)
         action_space = gym.spaces.Box(
             -np.inf, np.inf, ((generation_steps + 1) * self.horizon * self.action_dim,), dtype=np.float32
@@ -208,6 +228,15 @@ class ChainPolicy(Model):
 
     def act(self, inputs: dict[str, torch.Tensor], role: str = "") -> tuple[torch.Tensor, dict]:
         """Sample a complete chain, or recompute the likelihood of supplied taken_actions."""
+        # Learning receives native minibatches; only sampling is split here so its activation peak stays bounded.
+        if "taken_actions" not in inputs and inputs["observations"].shape[0] > self.sampling_batch_size:
+            results = [
+                self.act({"observations": observations}, role=role)
+                for observations in inputs["observations"].split(self.sampling_batch_size)
+            ]
+            return torch.cat([result[0] for result in results]), {
+                "log_prob": torch.cat([result[1]["log_prob"] for result in results])
+            }
         backbone, action = self.layout.unpack(inputs["observations"], next(self.head.parameters()).dtype)
         features = self.head._encode_features(backbone, action)
         taken = inputs.get("taken_actions")

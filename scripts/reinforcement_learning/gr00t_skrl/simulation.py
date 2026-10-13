@@ -74,15 +74,15 @@ def critic_state(policy_observations: dict[str, torch.Tensor]) -> np.ndarray:
         ),
         dim=-1,
     )
-    return state[0].detach().float().cpu().numpy().copy()
+    return state.detach().float().cpu().numpy().copy()
 
 
 def observation_packet(observations: dict) -> Observation:
     """Copy native observations to CPU so replies never retain live simulator buffers."""
     policy = observations["policy"]
     packet = Observation(
-        policy["table_cam"][0, ..., :3].detach().cpu().numpy().astype(np.uint8, copy=True),
-        policy["wrist_cam"][0, ..., :3].detach().cpu().numpy().astype(np.uint8, copy=True),
+        policy["table_cam"][..., :3].detach().cpu().numpy().astype(np.uint8, copy=True),
+        policy["wrist_cam"][..., :3].detach().cpu().numpy().astype(np.uint8, copy=True),
         critic_state(policy),
     )
     packet.validate()
@@ -109,7 +109,7 @@ def wait_for_model(env: ManagerBasedRLEnv, connection: socket.socket, timeout: f
 
 def serve(cfg: RunConfig) -> None:
     """Launch the native task, serve reset/step commands and close on any peer failure."""
-    env_cfg = parse_env_cfg(cfg.task, device="cuda:0", num_envs=1, overrides=["physics=isaacsim_physx"])
+    env_cfg = parse_env_cfg(cfg.task, device="cuda:0", num_envs=cfg.num_envs, overrides=["physics=isaacsim_physx"])
     env_cfg.scene.plane.spawn.visible = True
     env_cfg.seed = cfg.seed
     env_cfg.events = LocalEvents()
@@ -157,7 +157,7 @@ def serve(cfg: RunConfig) -> None:
                     request = rpc.receive()
                     if not isinstance(request, Request):
                         raise ValueError("Invalid RPC request")
-                    request.validate()
+                    request.validate(cfg.num_envs)
                     if request.command == "close":
                         break
                     if request.command == "reset":
@@ -166,25 +166,29 @@ def serve(cfg: RunConfig) -> None:
                         previous_state = packet.state.copy()
                         rpc.send(Transition(packet))
                         continue
-                    controls = torch.as_tensor(request.action, device=env.device).reshape(1, 7)
+                    if previous_state is None:
+                        raise ValueError("Reset is required before stepping")
+                    controls = torch.as_tensor(request.action, device=env.device)
                     observations, reward, terminated, truncated, infos = env.step(controls)
                     packet = observation_packet(observations)
-                    done = bool(terminated[0]) or bool(truncated[0])
-                    final = critic_state(infos["final_obs"]["policy"]) if done else None
-                    physical_state = final if done else packet.state
-                    motion = float(np.linalg.norm(physical_state[:3] - previous_state[:3]))
+                    terminated = terminated.detach().cpu().numpy().astype(bool, copy=True)
+                    truncated = truncated.detach().cpu().numpy().astype(bool, copy=True)
+                    done = terminated | truncated
+                    final = critic_state(infos["final_obs"]["policy"]) if done.any() else None
+                    physical_state = np.where(done[:, None], final, packet.state) if final is not None else packet.state
+                    motion = np.linalg.norm(physical_state[:, :3] - previous_state[:, :3], axis=-1).astype(np.float32)
                     previous_state = packet.state.copy()
-                    rpc.send(
-                        Transition(
-                            packet,
-                            float(reward[0]),
-                            bool(terminated[0]),
-                            bool(truncated[0]),
-                            final,
-                            request.action.copy(),
-                            motion,
-                        )
+                    reply = Transition(
+                        packet,
+                        reward.detach().float().cpu().numpy().copy(),
+                        terminated,
+                        truncated,
+                        final,
+                        request.action.copy(),
+                        motion,
                     )
+                    reply.validate(cfg.num_envs)
+                    rpc.send(reply)
             except BaseException as error:
                 if rpc is not None:
                     with suppress(OSError):

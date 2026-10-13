@@ -24,12 +24,18 @@ if TYPE_CHECKING:
     from .policy import FrozenEncoder
 
 
+def compatible_metadata(saved: dict, current: dict) -> bool:
+    """Interpret legacy single-environment checkpoints as training batches of one."""
+    return {"training_batch_size": 1, **saved} == {"training_batch_size": 1, **current}
+
+
 class RunState:
     """Native checkpoint module for cumulative counters, compatibility metadata and RNG."""
 
     def __init__(self, metadata: dict):
         self.metadata = metadata
         self.environment_steps = 0
+        self.transitions = 0
         self.updates = 0
         self.optimizer_steps = 0
         self.pending_rng: dict | None = None
@@ -39,6 +45,7 @@ class RunState:
         return {
             "metadata": self.metadata,
             "environment_steps": self.environment_steps,
+            "transitions": self.transitions,
             "updates": self.updates,
             "optimizer_steps": self.optimizer_steps,
             "rng": {
@@ -51,9 +58,10 @@ class RunState:
 
     def load_state_dict(self, state: dict) -> None:
         """Reject incompatible policy contracts and defer RNG restoration until initialization ends."""
-        if state.get("metadata") != self.metadata:
+        if not compatible_metadata(state.get("metadata", {}), self.metadata):
             raise ValueError("Incompatible GR00T skrl checkpoint metadata")
         self.environment_steps = state["environment_steps"]
+        self.transitions = state.get("transitions", self.environment_steps)
         self.updates = state["updates"]
         self.optimizer_steps = state["optimizer_steps"]
         self.pending_rng = state["rng"]
@@ -87,7 +95,7 @@ def validate_checkpoint(path: str, metadata: dict) -> dict:
     if not isinstance(modules, dict) or set(modules) != {"policy", "value", "optimizer", "run_state"}:
         raise ValueError("Expected a GR00T native skrl checkpoint; old handwritten PPO is unsupported")
     state = modules["run_state"]
-    if state.get("metadata") != metadata:
+    if not compatible_metadata(state.get("metadata", {}), metadata):
         raise ValueError("Incompatible GR00T skrl checkpoint metadata")
     steps = [int(item["step"].item()) for item in modules["optimizer"]["state"].values()]
     if not steps or min(steps) != state["optimizer_steps"] or max(steps) != state["optimizer_steps"]:
@@ -95,6 +103,7 @@ def validate_checkpoint(path: str, metadata: dict) -> dict:
     result = {
         "optimizer_steps": state["optimizer_steps"],
         "environment_steps": state["environment_steps"],
+        "transitions": state.get("transitions", state["environment_steps"]),
         "updates": state["updates"],
         "policy_state_sha256": tensor_state_digest(modules["policy"]),
         "value_state_sha256": tensor_state_digest(modules["value"]),
@@ -107,10 +116,11 @@ def validate_checkpoint(path: str, metadata: dict) -> dict:
 class Gr00tPPO(PPO):
     """Thin native agent hooks for terminal states, backbone residency and boundary checkpoints."""
 
-    def __init__(self, *, encoder: FrozenEncoder | None, run_state: RunState, **kwargs):
+    def __init__(self, *, encoder: FrozenEncoder | None, run_state: RunState, diagnostic_batch_size: int = 1, **kwargs):
         super().__init__(**kwargs)
         self.encoder = encoder
         self.run_state = run_state
+        self.diagnostic_batch_size = diagnostic_batch_size
         self.checkpoint_modules["run_state"] = run_state
         self.diagnostics: list[dict] = []
         self._resume_offset = run_state.environment_steps
@@ -135,6 +145,7 @@ class Gr00tPPO(PPO):
             next_states=next_states, terminated=terminated, truncated=timeout, infos=infos, **kwargs
         )
         self.run_state.environment_steps += 1
+        self.run_state.transitions += next_states.shape[0]
 
     def track_data(self, tag: str, value: float) -> None:
         """Retain native loss diagnostics and fail immediately on non-finite losses."""
@@ -146,6 +157,8 @@ class Gr00tPPO(PPO):
 
     def write_tracking_data(self, *, timestep: int, timesteps: int) -> None:
         """Use cumulative environment steps for native TensorBoard after a fresh trainer resumes."""
+        self.track_data("Stats / Synchronous steps", self.run_state.environment_steps)
+        self.track_data("Stats / Transitions", self.run_state.transitions)
         super().write_tracking_data(timestep=timestep + self._resume_offset, timesteps=timesteps + self._resume_offset)
 
     def post_interaction(self, *, timestep: int, timesteps: int) -> None:
@@ -172,12 +185,13 @@ class Gr00tPPO(PPO):
                 raise FloatingPointError("Non-finite gradients or unchanged original head")
             log_ratios = []
             with torch.no_grad():
-                observations = self.memory.get_tensor_by_name("observations")
-                actions = self.memory.get_tensor_by_name("actions")
-                previous = self.memory.get_tensor_by_name("log_prob")
-                for index in range(self.cfg.rollouts):
-                    _, output = self.policy.act({"observations": observations[index], "taken_actions": actions[index]})
-                    log_ratios.append(output["log_prob"] - previous[index])
+                observations = self.memory.get_tensor_by_name("observations").flatten(0, 1)
+                actions = self.memory.get_tensor_by_name("actions").flatten(0, 1)
+                previous = self.memory.get_tensor_by_name("log_prob").flatten(0, 1)
+                for start in range(0, observations.shape[0], self.diagnostic_batch_size):
+                    batch = slice(start, start + self.diagnostic_batch_size)
+                    _, output = self.policy.act({"observations": observations[batch], "taken_actions": actions[batch]})
+                    log_ratios.append(output["log_prob"] - previous[batch])
             log_ratios = torch.cat(log_ratios)
             ratios = log_ratios.exp()
             if not torch.isfinite(ratios).all():
@@ -190,6 +204,7 @@ class Gr00tPPO(PPO):
                 "clip_fraction": float(((ratios - 1).abs() > self.cfg.ratio_clip).float().mean()),
                 "recomputed_after_optimizer_step": len(getattr(self.policy, "recomputed_versions", set())) > 1,
                 "environment_steps": self.run_state.environment_steps,
+                "transitions": self.run_state.transitions,
                 "updates": self.run_state.updates,
                 "optimizer_steps": self.run_state.optimizer_steps,
                 "head_changed": before != after,
