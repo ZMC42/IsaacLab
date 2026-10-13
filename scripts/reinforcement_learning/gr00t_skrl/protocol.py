@@ -45,6 +45,24 @@ class RunConfig:
     encoder_batch_size: int = 1
     sampling_batch_size: int = 1
     training_batch_size: int = 1
+    distributed: bool = False
+    rank: int = 0
+    local_rank: int = 0
+    world_size: int = 1
+    node_rank: int = 0
+    node_id: str = ""
+    gpu_id: str = "0"
+    job_dir: str | None = None
+    job_id: str | None = None
+    checkpoint_interval: int = 1
+    verify_distributed_state: bool = False
+    simulation_identity: dict | None = None
+    warmup_updates: int = 0
+
+    @property
+    def model_device(self) -> str:
+        """Model device in the node's original CUDA visibility mask."""
+        return f"cuda:{self.local_rank}" if self.distributed else "cuda:0"
 
     @property
     def mini_batches(self) -> int:
@@ -65,8 +83,23 @@ class RunConfig:
             raise ValueError("sigma must be finite and positive")
         if not self.learning_rate > 0 or not np.isfinite(self.learning_rate):
             raise ValueError("learning_rate must be finite and positive")
-        if self.rpc_timeout <= 0 or self.episode_steps is not None and self.episode_steps < 1:
+        if (
+            not np.isfinite(self.rpc_timeout)
+            or self.rpc_timeout <= 0
+            or self.episode_steps is not None
+            and self.episode_steps < 1
+        ):
             raise ValueError("Timeout and episode length must be positive")
+        if type(self.checkpoint_interval) is not int or self.checkpoint_interval < 1:
+            raise ValueError("Checkpoint interval must be a positive number of updates")
+        if self.warmup_updates < 0 or self.warmup_updates >= self.timesteps // self.rollouts:
+            raise ValueError("Warmup must leave at least one complete update in the measurement window")
+        if self.mode == "inference" and self.warmup_updates:
+            raise ValueError("Warmup updates require training mode")
+        if self.world_size < 1 or not 0 <= self.rank < self.world_size or min(self.local_rank, self.node_rank) < 0:
+            raise ValueError("Invalid distributed rank layout")
+        if not self.distributed and (self.world_size != 1 or self.rank != 0 or self.local_rank != 0):
+            raise ValueError("Rank configuration requires the distributed launcher")
         if not 1 <= self.viser_port <= 65535:
             raise ValueError("Viser port must be between 1 and 65535")
         if "nvidia/Cosmos-Reason2" not in self.backbone_path:

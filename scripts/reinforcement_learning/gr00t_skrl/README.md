@@ -2,7 +2,7 @@
 
 This local runner fine-tunes the **complete original N1.7 action head** from the existing micro-SFT checkpoint. It uses skrl 2.1.0 PyTorch `PPO`, `RandomMemory` and `SequentialTrainer` for rollout collection, GAE, losses, backward passes, Adam updates, TensorBoard and checkpoint serialization. The frozen vision/language backbone is held separately from the policy, optimizer and checkpoint.
 
-The simulator and model run in separate uv environments and processes on one GPU. The simulator uses Isaac Sim 6.1 / PhysX, one Franka per environment and the task's table/wrist RGB cameras. This is an engineering smoke test with a local approach reward; it does not establish stacking ability or PPO convergence. Shared task definitions and Isaac-GR00T source are unchanged.
+The simulator and model run in separate uv environments and processes, with one pair per GPU. The simulator uses Isaac Sim 6.1 / PhysX, one Franka per environment and the task's table/wrist RGB cameras. This is an engineering smoke test with a local approach reward; it does not establish stacking ability or PPO convergence. Shared task definitions and Isaac-GR00T source are unchanged.
 
 ## Parallel environment training
 
@@ -74,6 +74,161 @@ weights; the rates do not establish sustained-training speedup or convergence.
 Restoring the N=4 checkpoint into N=2 inference with encoder/sampling batch sizes of two also
 passed: four new transitions were collected, likelihood recomputation error was zero, and the
 optimizer stayed at step 16.
+
+## Multi-GPU and multi-node training
+
+`launch_multigpu` reuses Isaac Lab's `MultiGpuLauncherCfg` / `run_multigpu_cli` and runs
+`launch.py` once per torchrun rank. Every GPU owns a simulator/model pair and a private local
+socket. Only model processes inherit the rank/rendezvous environment and join skrl's native
+NCCL group. Models use `cuda:LOCAL_RANK`; each simulator sees only that GPU as `cuda:0`.
+The supervisor never imports skrl. Both children retain their existing uv project and `--no-sync`.
+The existing single-GPU `launch` command and its defaults remain available.
+
+Replace the asset paths below with the same absolute paths on every node. The GR00T uv project
+defaults to `../Isaac-GR00T`; override `--model_project` if necessary.
+
+```bash
+uv run --no-sync python -m scripts.reinforcement_learning.gr00t_skrl.launch_multigpu \
+  --num_gpus 2 --job_id gr00t_two_gpu --run_dir /data/runs/gr00t_two_gpu \
+  --model_path /data/models/stack-cube-n1.7-sft/checkpoint \
+  --backbone_path /data/models/nvidia/Cosmos-Reason2-2B \
+  --num_envs 2 --timesteps 4 --rollouts 2 --episode_steps 2 \
+  --checkpoint_interval 1 --verify_distributed_state
+```
+
+Add `--dry_run` to print the command without reserving output directories or starting workers.
+The launcher also accepts Isaac Lab's torchrun logging options, including `--log_all_ranks`,
+`--tee`, `--redirects` and `--log_dir`. Console output defaults to local rank 0 on each node;
+every rank always keeps its own simulation/model logs and exit codes.
+
+For two nodes, run this on **each** node with `GR00T_NODE_RANK=0` on the master and
+`GR00T_NODE_RANK=1` on the other node:
+
+```bash
+uv run --no-sync python -m scripts.reinforcement_learning.gr00t_skrl.launch_multigpu \
+  --num_gpus 2 --nnodes 2 --node_rank "$GR00T_NODE_RANK" \
+  --master_addr 10.0.0.10 --master_port 29500 \
+  --job_id gr00t_four_gpu --run_dir /data/runs/gr00t_four_gpu \
+  --model_path /data/models/stack-cube-n1.7-sft/checkpoint \
+  --backbone_path /data/models/nvidia/Cosmos-Reason2-2B \
+  --num_envs 2 --timesteps 4 --episode_steps 2 --checkpoint_interval 1
+```
+
+The node count is fixed. `--rdzv_backend`, `--rdzv_endpoint` and `--rdzv_id` are also supported;
+an explicit rendezvous ID must match `--job_id`. Elastic node ranges and nonzero `--max_restarts`
+are rejected. Every multi-node invocation requires explicit `--job_id`, `--run_dir`,
+`--node_rank` and a master address or rendezvous endpoint. Node output claims and rank directories
+are exclusive: use a fresh run directory when restarting. If Viser is enabled, only global rank 0
+starts its viewer.
+
+All nodes must have identical code, dependency versions, task/PPO settings, model/processor assets
+and resume contents at identical absolute paths. Shared storage is optional: pre-stage assets and
+the checkpoint on each node when using local disks. Before constructing the native agent, the
+models compare rollout settings, simulator checkout/version identity, runner/GR00T code hashes,
+processor/config hashes, actual frozen-backbone and initial-head hashes, and the existing CPU
+checkpoint validation summaries. The CPU summaries include optimizer settings and RunState/RNG
+identity as well as model/Adam tensors. No full model or checkpoint is exchanged by these checks.
+
+For W total ranks, N environments per rank, R rollout steps, minibatch upper bound B and E epochs:
+
+| Quantity | Contract |
+| --- | --- |
+| Local/global rollout samples | `R × N` / `W × R × N` |
+| Native minibatches per epoch | `ceil(R × N / B)` on every rank |
+| Shared Adam steps per update | `E × ceil(R × N / B)` |
+| New global transitions | `W × N × timesteps` |
+| New synchronous steps | `timesteps` |
+
+Rollouts and GAE stay local. Native skrl broadcasts initial policy/critic parameters and averages
+gradients after backward, before clipping and Adam. Advantages are normalized locally, so this is
+not equivalent to normalizing a centrally combined rollout. Uneven native minibatches retain every
+sample; there is no padding, dropped tail or extra gradient accumulation. Expanding W grows the
+global sample count and leaves the learning rate unchanged. Rank-derived seeds give independent
+sampling/shuffle streams; deterministic physics resets are preserved.
+
+### Checkpoints, recovery and failure
+
+`--checkpoint_interval` counts cumulative **PPO updates**, defaults to 1 for `launch` and 10 for
+`launch_multigpu`, and must be positive. Normal training completion saves the last full update if
+it was not already saved. Inference does not write checkpoints. Every save checks shared counters,
+collects Python/NumPy/Torch CPU/current-GPU RNG for every rank, and lets only global rank 0 call
+native `save`. It writes a temporary file in the destination directory, fsyncs, atomically renames
+it, then communicates the result to all ranks. Temporary files are never resume candidates.
+`--verify_distributed_state` additionally compares full policy/critic/Adam hashes at save boundaries
+and initial construction; use it for correctness runs because these hashes add diagnostic cost.
+All resumes verify loaded states across ranks regardless of this option.
+
+The four top-level checkpoint modules and original head state-dict names are unchanged.
+Versioned distribution metadata and per-rank RNG are stored inside `run_state`, with the original
+`rng` field retained. Resume accepts old single-environment and single-GPU checkpoints and allows
+changing GPU/node count, rank mapping, environment count, encoding/sampling batches and save
+interval. Immutable model/processor/chain/PPO settings, including training batch size, still must
+match. Historical transitions are never recalculated using the new topology.
+
+Matching topology and N restore the corresponding rank's RNG. A topology/N change derives new
+streams from the saved base seed, completed updates and new rank. Legacy checkpoints without a
+base seed use the invocation seed when deriving new streams. Physics always starts a new episode.
+Single-GPU inference can read the extended checkpoints via the original `launch --mode inference`.
+
+```text
+/data/runs/<job>/
+├── nodes/node_00000.json             # Exclusive node claim and launcher arguments
+├── ranks/rank_00000/                 # Global rank, even with node-local storage
+│   ├── config.json, simulation_versions.json
+│   ├── simulation.log, train.log, metrics.json, processes.json
+│   └── native/                      # TensorBoard and checkpoints only on rank 0
+│       └── checkpoints/agent_<synchronous_steps>.pt
+├── ranks/rank_00001/...
+└── metrics.json                     # Rank 0's shared counters and small rank summaries
+```
+
+With local disks, copy the rank-0 checkpoint to the same resume path on every node before restarting.
+Any child failure terminates its local pair; torchrun then aborts the remaining ranks. SIGINT/SIGTERM
+go through local process-group and socket cleanup, including descendants whose uv leader has exited.
+Interrupted or failed updates are not saved. Storage failure fails the whole job and leaves earlier
+checkpoints intact. Restart explicitly with `--resume` and a new job directory.
+
+RPC timeouts default to 1800 s in the multi-GPU entry and 300 s in the original entry; override
+`--rpc_timeout` for large asset loads or debugging. The native skrl NCCL group uses PyTorch's finite
+default timeout (600 s in the validated model environment); torchrun rendezvous also has a finite
+timeout. Actual multi-node fault propagation and cleanup still need hardware validation.
+
+### Throughput and validation status
+
+`--warmup_updates K` excludes the first K complete updates of this invocation from the synchronized
+throughput window and phase totals; it defaults to 0 and must leave at least one measured update.
+Warmup does not discard samples or change counters/save scheduling. `metrics.json` reports both all
+new transitions and measured transitions, plus time spent in simulation/RPC, encoding, sampling,
+native PPO (including synchronization), diagnostics, checkpoint and backbone offload/restore.
+The main rate includes periodic/final checkpoint writes and diagnostics; initialization and the
+final frozen-backbone verification are outside the window. CUDA work is synchronized for timing.
+The job rate uses measured global transitions divided by the slowest rank's window, not the sum of
+rank rates. Rank logs retain invocation-local counts separately from cumulative historical counts.
+
+For sustained comparisons, use the same initial weights and per-rank N/R/B/E, chain configuration
+and save interval (start with 10), several warmup updates, and a window covering multiple save
+cycles. Repeat measurements; report `speedup(W) = throughput(W) / throughput(1)` and
+`efficiency(W) = speedup(W) / W`, phase bottlenecks and whole-GPU peaks. Run an independent NCCL
+probe before real two-GPU training. Do not add NCCL workarounds unless that probe demonstrates a need.
+Native object broadcast and contiguous gradient buffers increase temporary memory beyond the
+earlier single-GPU measurements; those peaks are not a multi-GPU memory budget.
+
+On the local single RTX 4090, the new torchrun entry was exercised with one rank and N=2, restoring
+the old `smoke_v3` checkpoint: four new synchronous steps produced eight transitions and two PPO
+updates (16 new Adam steps), followed by the final interval-10 checkpoint. Both children exited
+with zero status, gradients/losses were finite, and the frozen backbone stayed unchanged. This is
+single-rank compatibility evidence. Real two-GPU NCCL, multi-node training/resume/failure tests and
+sustained speedup have **not** been validated on this one-GPU host.
+
+The extended checkpoint also passed original-entry N=1 inference: two new transitions, unchanged
+Adam step 20 and no checkpoint writes. A subsequent one-rank N=2 run passed periodic saving and
+warmup accounting: 12 new transitions, eight measured after one warmup update, cumulative Adam
+step 44, and checkpoints at synchronous steps 8 and 12. Both children exited normally. These
+short runs validate accounting and persistence, not sustained throughput.
+Single-rank torchrun fault injection during initialization also passed: killing either child and
+interrupting the launcher returned nonzero status, recorded both child exit codes, removed the
+socket directory and left no live process in either child group. These checks cover local startup
+cleanup; faults inside real multi-rank PPO/NCCL collectives still require dedicated hardware runs.
 
 ## Debugging and learning
 
@@ -295,6 +450,13 @@ Coverage protects full-chain probability/memory, original-head gradient and drop
 encoding batch order and tail batches, per-environment reference-state decoding, partial auto-reset,
 independently calculated multi-environment timeout returns, complete uneven minibatch sampling,
 legacy single-environment checkpoint migration and new-process restoration of model/optimizer/RNG/counters.
+Two CPU/Gloo child processes test rank coordination, global counters, rank RNG restoration and
+topology-change reseeding, checkpoint identity/config disagreement and atomic write failure.
+Additional coverage checks multi-node dry runs, simulator/model environment isolation, descendant
+cleanup, cumulative save intervals and resumed warmup windows. These CPU collectives do not validate
+NCCL or native distributed gradients. `test_native_distributed_ppo` uses two real GPUs to check
+native initial broadcast, independent trajectory sampling and equal updated policy/critic/Adam;
+it is skipped when fewer than two GPUs are visible. Real GR00T/Kit scaling requires separate runs.
 Changing probability `sum` to `mean` or using reset state for timeout bootstrap makes the
 corresponding test fail. No native PPO/GAE implementation is copied.
 

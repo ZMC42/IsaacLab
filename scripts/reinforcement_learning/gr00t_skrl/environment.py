@@ -15,6 +15,7 @@ import numpy as np
 import torch
 from skrl.envs.wrappers.torch import Wrapper
 
+from .distributed import measure_phase
 from .policy import ChainPolicy, FrozenEncoder
 from .protocol import Request, RpcConnection, RunConfig, Transition
 
@@ -36,6 +37,9 @@ class RemoteEnvironment(Wrapper):
         self._autoreset_pending = False
         self._closed = False
         self.metrics: list[dict] = []
+        self.rank = cfg.rank
+        self.phase_seconds: dict[str, float] = {}
+        self.warmup_steps = cfg.warmup_updates * cfg.rollouts
         connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         connection.settimeout(cfg.rpc_timeout)
         deadline = time.monotonic() + cfg.rpc_timeout
@@ -113,6 +117,7 @@ class RemoteEnvironment(Wrapper):
             self.metrics.append(
                 {
                     "env_id": index,
+                    "rank": self.rank,
                     "environment_step": step,
                     "command": command[index].tolist(),
                     "motion_m": float(reply.motion[index]),
@@ -127,6 +132,8 @@ class RemoteEnvironment(Wrapper):
             torch.tensor(value, device=self.device).reshape(self.num_envs, 1)
             for value in (reply.reward, reply.terminated, reply.truncated)
         ]
+        if self.warmup_steps and step == self.warmup_steps:
+            self.phase_seconds.clear()
         return next_observations, *tensors, infos
 
     def render(self) -> None:
@@ -145,8 +152,9 @@ class RemoteEnvironment(Wrapper):
 
     def _request(self, request: Request) -> Transition:
         request.validate(self.num_envs)
-        self.rpc.send(request)
-        reply = self.rpc.receive()
+        with measure_phase(self.phase_seconds, "simulation_rpc", self.device):
+            self.rpc.send(request)
+            reply = self.rpc.receive()
         if isinstance(reply, str):
             raise RuntimeError(f"Simulation failed: {reply}")
         if not isinstance(reply, Transition):
@@ -156,5 +164,6 @@ class RemoteEnvironment(Wrapper):
 
     def _encode(self, reply: Transition) -> torch.Tensor:
         self._state = torch.as_tensor(reply.observation.state, device=self.device)
-        self._observations = self.encoder.encode(reply.observation)
+        with measure_phase(self.phase_seconds, "encoding", self.device):
+            self._observations = self.encoder.encode(reply.observation)
         return self._observations

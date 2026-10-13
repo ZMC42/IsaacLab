@@ -170,6 +170,58 @@ Isaac Lab 只重置结束的环境，其他机器人继续运行。确定性初�
 随机采样产生的数据副本和相机渲染也占显存。先从 N=2 验证，再实测显存与吞吐量。
 运行命令和恢复规则见 [runner README 的并行训练说明](../scripts/reinforcement_learning/gr00t_skrl/README.md#parallel-environment-training)。
 
+### 3.4 多机多卡共同训练一个策略
+
+使用专门的 `gr00t_skrl.launch_multigpu` 入口。它复用 Isaac Lab 的 torchrun launcher，
+每张 GPU 启动一组独立的仿真和模型进程。只有模型保留 `RANK/LOCAL_RANK/WORLD_SIZE` 并加入
+skrl 的 NCCL 通信组；模型用 `cuda:LOCAL_RANK`，仿真只看到对应 GPU 并使用 `cuda:0`。
+双 uv 环境、原 head、生成链概率、state critic 和 native PPO/GAE 均沿用原实现。
+
+```bash
+uv run --no-sync python -m scripts.reinforcement_learning.gr00t_skrl.launch_multigpu \
+  --num_gpus 2 --job_id gr00t_two_gpu --run_dir /data/runs/gr00t_two_gpu \
+  --model_path /data/models/stack-cube-n1.7-sft/checkpoint \
+  --backbone_path /data/models/nvidia/Cosmos-Reason2-2B \
+  --num_envs 2 --timesteps 4 --episode_steps 2 \
+  --checkpoint_interval 1 --verify_distributed_state
+```
+
+示例资产路径需替换为所有节点一致的实际绝对路径。加 `--dry_run` 可只检查启动命令。
+多机在每个节点分别执行入口，传相同的 `--nnodes`、`--master_addr/--master_port`、
+`--job_id` 和 `--run_dir`，并分别传 `--node_rank`；支持固定节点数的 `--rdzv_*`。
+所有节点预置相同代码、依赖、资产和恢复文件即可，不要求共享磁盘。运行开始时会比较配置、
+代码/资产指纹与 checkpoint 内容身份，输出按全局 rank 隔离，只有全局 rank 0 写汇总、
+TensorBoard 和 checkpoint。Viser 也只在全局 rank 0 启用。
+
+设总 rank 数 W，每卡环境数 N，rollout 长度 R，训练批大小上限 B，学习 epochs 数 E：
+
+| 计数 | 多卡含义 |
+| --- | --- |
+| 本地 / 全局 rollout 样本 | `R×N` / `W×R×N` |
+| 每次共同 PPO 更新的 Adam 步数 | `E×ceil(R×N/B)`，不乘 W |
+| 本次新增 transitions | `W×N×timesteps` |
+| 本次同步步数 | `timesteps`，不乘 W 或 N |
+
+每个 rank 本地做 GAE 和优势值标准化；skrl 广播初始 policy/critic，并在 backward 后、
+裁剪前平均梯度，然后执行相同的 Adam 更新。它不等价于先拼接所有 rollout 再统一标准化。
+扩卡增加全局样本量，学习率保持不变。各 rank 独立采样、shuffle，物理 reset 仍是确定性的。
+
+`--checkpoint_interval` 按累计 PPO 更新数保存：原单卡入口默认 1，多卡入口默认 10。
+所有 rank 在完整更新边界汇集计数与各自 RNG，由 rank 0 写临时文件并原子替换最终文件，
+再共同确认保存结果。正常结束会补存最后一次完整更新，同一边界不会重复保存。
+恢复可改变卡数、节点布局和每卡 N，历史 transition 计数不会按新拓扑重算；相同拓扑/N
+恢复对应 rank RNG，否则按已保存的基准 seed、更新数和新 rank 派生新流。仿真始终从新 episode 开始。
+新格式仍可用原单卡入口推理，顶层四个 checkpoint 模块及原 head 参数名称保持一致。
+
+任何子进程失败都终止整组；不保存不完整更新，使用新输出目录和 `--resume` 显式重启。
+首版拒绝自动重启和弹性节点数。RPC 和 native NCCL 都有有限超时，跨节点故障传播仍需实机验收。
+
+吞吐测试可用 `--warmup_updates K` 排除本次最初 K 次更新，再覆盖多个完整更新和保存周期。
+汇总速率以最慢 rank 的共同窗口计算，包含 PPO 同步、诊断、周期/结束保存和 backbone 搬运；
+按阶段记录耗时，不能简单相加各 rank 的速率。双卡还会增加广播和连续梯度缓冲的临时显存。
+当前单 4090 已验证新入口的单 rank 兼容路径；双 GPU/NCCL、多机和持续吞吐尚未实测。
+完整命令、恢复文件位置、测试与验收边界见 [runner README](../scripts/reinforcement_learning/gr00t_skrl/README.md#multi-gpu-and-multi-node-training)。
+
 ## 4. 第一站：从 SFT 初始化到可训练模型
 
 `train.run()` 先设随机种子，再创建：
@@ -434,7 +486,7 @@ optimizer.step()
 
 1. 比较 head 指纹，确认实际参数改变。
 2. 用最终参数重算这一批旧链，记录 ratio、近似 KL 和 clip fraction。
-3. 在完整 rollout 边界保存 checkpoint。
+3. 按累计更新间隔，在完整 rollout 边界保存 checkpoint（原单卡默认每次保存）。
 4. 将 frozen backbone 放回 GPU，供下一次采样使用。
 
 更新后 KL 的诊断公式是 `mean(ρ − 1 − logρ)`，是基于旧样本的估计量。诊断的 ratio/KL 使用四次 Adam 更新之后的模型；native loss 是更新过程中的 minibatch 平均，两者的测量时刻不同。
@@ -461,7 +513,7 @@ checkpoint 包含 `policy`、`value`、`optimizer` 和 `run_state`。`run_state`
 
 恢复仍依赖 micro-SFT config/processor、当前 GR00T 代码和本地 Cosmos 权重。兼容性 metadata 包含模型路径、生成步数、sigma、学习率、rollout 配置和训练批大小等。移动资产或修改这些设置后，恢复会拒绝不匹配的 checkpoint；processor 能处理旧 backbone 内嵌路径，不代表 PPO metadata 可以随意改变。
 
-恢复允许改变 `num_envs`、编码批大小和采样批大小。旧单环境 checkpoint 缺少训练批大小时按 1 校验，缺少 `transitions` 时按历史 `environment_steps` 推导；后续每次交互增加 N 条样本。仿真从新 episode 开始，改变并行数或分批方式不保证采样轨迹一致。
+恢复允许改变 `num_envs`、编码批大小、采样批大小及分布式拓扑。旧单环境 checkpoint 缺少训练批大小时按 1 校验，缺少 `transitions` 时按历史 `environment_steps` 推导；后续每次交互增加 W×N 条全局样本（单卡 W=1）。仿真从新 episode 开始，改变并行数或分批方式不保证采样轨迹一致。
 
 ### 10.2 在 VS Code 中恢复或推理
 
