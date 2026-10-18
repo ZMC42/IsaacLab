@@ -544,7 +544,11 @@ def _mirror_is_current(url: str, mirrored: str) -> bool:
         return True
     try:
         with open(mirrored + _MIRROR_FINGERPRINT_SUFFIX, encoding="utf-8") as f:
-            return json.load(f) == remote
+            cached = json.load(f)
+        # A content revision identifies the bytes independently of Last-Modified.
+        if remote["hash"] or remote["version"]:
+            return all(cached.get(key) == remote[key] for key in ("hash", "version", "size"))
+        return cached == remote
     except (OSError, ValueError):
         return False
 

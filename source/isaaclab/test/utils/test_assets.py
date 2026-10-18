@@ -572,6 +572,26 @@ def test_read_file_uses_the_local_copy_when_it_matches_the_server(asset_cache, m
     assert assets_utils.read_file(_REMOTE_URL).read() == b"cached bytes"
 
 
+@pytest.mark.parametrize("identity", [{"hash": "abc123", "version": ""}, {"hash": "", "version": "abc123"}])
+def test_content_revision_reuses_cached_bytes_when_only_modification_time_changed(asset_cache, monkeypatch, identity):
+    """Test identical content is reused after a server updates only its modification time."""
+    revision = {**identity, "size": 12, "modified_time": "2026-07-01 10:00:00"}
+    _cache_asset(asset_cache, _REMOTE_URL, b"cached bytes", revision)
+    _serve(monkeypatch, {_REMOTE_URL: {**revision, "modified_time": "2026-07-29 10:00:00"}})
+
+    assert assets_utils.read_file(_REMOTE_URL).read() == b"cached bytes"
+
+
+@pytest.mark.parametrize("changed", [{"hash": "new-hash"}, {"version": "new-version"}, {"size": 13}])
+def test_content_revision_or_size_change_invalidates_the_cache(asset_cache, monkeypatch, changed):
+    """Test content identity and size changes still require a new download."""
+    revision = {"hash": "abc123", "version": "version-1", "size": 12, "modified_time": "2026-07-01 10:00:00"}
+    _cache_asset(asset_cache, _REMOTE_URL, b"cached bytes", revision)
+    _serve(monkeypatch, {_REMOTE_URL: {**revision, **changed}})
+
+    assert not assets_utils._usable_mirror(_REMOTE_URL)
+
+
 def test_read_file_refetches_when_the_server_copy_changed(asset_cache, monkeypatch):
     """Test a changed remote asset is downloaded again rather than served stale."""
     stale = {"hash": "abc123", "version": "", "size": 12, "modified_time": "2026-07-01 10:00:00"}
