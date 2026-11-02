@@ -223,6 +223,22 @@ def ensure_rtx_hydra_engine_attached() -> None:
         logger.error("RTX Hydra engine attach failed: %s", e)
 
 
+def reset_isaac_rtx_render_history() -> None:
+    """Clear global RTX history and require a fresh update on the next capture.
+
+    Deliver the queued reset without rendering, so reset events can still change scene
+    poses before capture. Invalidate the update stamp because episode resets need not
+    advance either the physics step or render generation.
+    """
+    global _last_render_update_key
+
+    import omni.kit.app
+
+    omni.usd.get_context().reset_renderer_accumulation()
+    omni.kit.app.get_app().get_message_bus_event_stream().pump()
+    _last_render_update_key = (0, -1, -1)
+
+
 def ensure_isaac_rtx_render_update(force: bool = False) -> None:
     """Ensure the Isaac RTX renderer has been pumped for the current sim step.
 

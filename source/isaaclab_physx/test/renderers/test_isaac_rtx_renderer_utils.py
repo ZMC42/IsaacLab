@@ -238,6 +238,28 @@ class TestEnsureIsaacRtxRenderUpdate:
 
         mock_app.update.assert_not_called()
 
+    def test_camera_reset_publishes_without_clock_advance(
+        self, mock_sim, mock_sim_context, mock_omni_kit_app, mock_omni_usd
+    ):
+        """Reset invalidates a cached update; the next capture renders once at the unchanged step."""
+        from isaaclab_physx.renderers.isaac_rtx_renderer import IsaacRtxRenderer
+
+        mock_app = mock_omni_kit_app.get_app.return_value
+        mock_sim_context.instance.return_value = mock_sim
+        renderer = IsaacRtxRenderer.__new__(IsaacRtxRenderer)
+
+        with patch.object(rtx_utils, "_get_stage_streaming_busy", return_value=False):
+            rtx_utils.ensure_isaac_rtx_render_update()
+            mock_app.update.reset_mock()
+
+            renderer.reset(None, [0])
+            mock_app.update.assert_not_called()
+
+            rtx_utils.ensure_isaac_rtx_render_update()
+            rtx_utils.ensure_isaac_rtx_render_update()
+
+        mock_app.update.assert_called_once()
+
     @pytest.mark.parametrize("force", [False, True])
     def test_not_rendering_pumps_only_when_forced(self, mock_sim, mock_sim_context, mock_omni_kit_app, force):
         """Offscreen capture publishes through SDP only when a frame is requested."""

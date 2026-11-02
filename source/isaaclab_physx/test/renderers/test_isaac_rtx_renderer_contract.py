@@ -48,6 +48,37 @@ def _install_omni_stubs(monkeypatch):
     return replicator_core_module, syntheticdata_module
 
 
+@pytest.mark.parametrize("env_ids", [[0], None, []])
+def test_camera_reset_delivers_temporal_history_reset_before_capture(monkeypatch, env_ids):
+    """A real camera reset synchronously clears RTX history without rendering the pre-variation scene."""
+    _install_omni_stubs(monkeypatch)
+    from isaaclab_physx.renderers.isaac_rtx_renderer import IsaacRtxRenderer
+
+    from isaaclab.sensors import Camera, SensorBase
+
+    effects = MagicMock()
+    sys.modules["omni.usd"].get_context.return_value.reset_renderer_accumulation = effects.reset_history
+    kit = MagicMock()
+    kit.app.get_app.return_value.get_message_bus_event_stream.return_value.pump = effects.pump
+    kit.app.get_app.return_value.update = effects.render
+    monkeypatch.setitem(sys.modules, "omni.kit", kit)
+    monkeypatch.setitem(sys.modules, "omni.kit.app", kit.app)
+    monkeypatch.setattr(sys.modules["omni"], "kit", kit, raising=False)
+
+    camera = Camera.__new__(Camera)
+    camera._is_initialized = True
+    camera._num_envs = 2
+    camera._renderer = IsaacRtxRenderer.__new__(IsaacRtxRenderer)
+    camera._render_data = None
+    camera._clear_callbacks = MagicMock()
+    camera._update_poses = MagicMock()
+    camera._resolve_env_ids_wp = lambda ids: ids
+    with patch.object(SensorBase, "reset"):
+        camera.reset(env_ids)
+
+    assert effects.mock_calls == ([] if env_ids == [] else [call.reset_history(), call.pump()])
+
+
 @pytest.mark.parametrize("isaac_sim_version", ["5.1", "6.0"])
 def test_isaac_rtx_supported_output_types_include_rgb_hdr(monkeypatch, isaac_sim_version):
     """Isaac RTX advertises RGB_HDR as a 3-channel float output; ALBEDO and simple shading need Isaac Sim 6.0+."""

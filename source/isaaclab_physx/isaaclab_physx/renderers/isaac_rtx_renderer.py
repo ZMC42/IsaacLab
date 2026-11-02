@@ -36,6 +36,7 @@ from .isaac_rtx_renderer_utils import (
     apply_isaac_rtx_global_settings,
     ensure_isaac_rtx_render_update,
     ensure_rtx_hydra_engine_attached,
+    reset_isaac_rtx_render_history,
 )
 from .visual_material import FabricVisualMaterialWriter
 
@@ -773,6 +774,18 @@ class IsaacRtxRenderer(BaseRenderer):
         assert camera_data.info is not None, "CameraData.info should be created in CameraData.allocate"
         for output_name in camera_data.info:
             camera_data.info[output_name] = render_data.renderer_info.get(output_name)
+
+    def reset(self, render_data: IsaacRtxRenderData, env_ids: Sequence[int] | None = None) -> None:
+        """Discard temporal history before the next post-reset capture.
+
+        RTX accumulation is process-global, so a partial reset also clears history for
+        cameras and environment tiles that continue their episodes. Deliver the queued
+        reset now without rendering: scene variations may still change poses afterward.
+        """
+        if env_ids is not None and len(env_ids) == 0:
+            return
+
+        reset_isaac_rtx_render_history()
 
     def cleanup(self, render_data: IsaacRtxRenderData | None):
         """Detach annotators, destroy the owned tiled render product, and drop held refs.
