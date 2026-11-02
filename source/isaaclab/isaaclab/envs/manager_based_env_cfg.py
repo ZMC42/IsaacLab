@@ -128,14 +128,14 @@ class ManagerBasedEnvCfg:
     """
 
     num_rerenders_on_reset: int = 0
-    """Number of render steps to perform after reset. Defaults to 0, which means no render step will be
-    performed after reset.
+    """Number of additional simulator render calls after reset. Defaults to 0.
 
-    * When this is 0, no render step will be performed after reset. Data collected from sensors after performing
-      reset will be stale and will not reflect the latest states in simulation caused by the reset.
-    * When this is greater than 0, the specified number of extra render steps will be performed to update the
-      sensor data to reflect the latest states from the reset. This comes at a cost of performance as additional
-      render steps will be performed after each time an environment is reset.
+    Sensors refresh according to their renderer's reset and capture behavior. RTX cameras
+    invalidate cached updates and temporal history during reset, so their next capture produces
+    a fresh image without additional reset renders or physics steps.
+
+    Positive values request extra simulator render calls at an additional performance cost.
+    Renderers that defer rendering until capture may not produce a camera frame on every call.
     """
 
     wait_for_textures: bool = True
