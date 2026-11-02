@@ -22,6 +22,15 @@ class ManagerBasedRLEnvCfg(ManagerBasedEnvCfg):
     ui_window_class_type: type | str | None = "isaaclab.envs.ui.manager_based_rl_env_window:ManagerBasedRLEnvWindow"
 
     # general settings
+    auto_reset: bool = True
+    """Whether :meth:`ManagerBasedRLEnv.step` resets completed environments in the same call.
+
+    If False, the caller owns episode resets through :meth:`ManagerBasedRLEnv.reset`.
+    Termination and truncation signals are still returned, with observations from the
+    completed episode. Reset recorders and post-reset rendering run only on explicit reset.
+    Visualizer reset requests are reported as terminations without resetting immediately.
+    """
+
     is_finite_horizon: bool = False
     """Whether the learning task is treated as a finite or infinite horizon problem for the agent.
     Defaults to False, which means the task is treated as an infinite horizon problem.

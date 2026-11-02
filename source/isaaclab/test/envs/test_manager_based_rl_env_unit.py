@@ -8,10 +8,12 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import gymnasium as gym
 import numpy as np
 import pytest
+import torch
 
 from isaaclab.envs import ManagerBasedRLEnv
 
@@ -102,3 +104,55 @@ def test_obs_space_follows_clip_constraint():
             assert term_space.shape == expected_shapes[term_name]
             assert np.all(term_space.low == low)
             assert np.all(term_space.high == high)
+
+
+@pytest.mark.parametrize("auto_reset,manual_reset", [(True, False), (False, False), (False, True)])
+def test_step_resets_only_when_owned_by_environment(auto_reset, manual_reset):
+    """Caller-owned resets preserve done signals and terminal observations without reset side effects."""
+    env = object.__new__(ManagerBasedRLEnv)
+    env._is_closed = True
+    env.cfg = SimpleNamespace(
+        auto_reset=auto_reset,
+        decimation=1,
+        sim=SimpleNamespace(dt=0.02, render_interval=1),
+        compute_final_obs=True,
+        num_rerenders_on_reset=2,
+    )
+    env.scene = Mock(num_envs=2)
+    env.sim = Mock(device="cpu", is_rendering=True)
+    env.sim.consume_reset_request.return_value = manual_reset
+    env.render_enabled = env.has_rtx_sensors = True
+    env._physics_handles_decimation = False
+    env._sim_step_counter = env.common_step_counter = 0
+    env.episode_length_buf = torch.zeros(2, dtype=torch.long)
+    env.action_manager = Mock()
+    env.recorder_manager = Mock(active_terms=[])
+    env.reward_manager = Mock()
+    env.reward_manager.compute.return_value = torch.tensor([1.0, 0.0])
+    env.termination_manager = Mock()
+    env.termination_manager.terminated = torch.tensor([True, False])
+    env.termination_manager.time_outs = torch.tensor([False, False])
+    env.termination_manager.compute.return_value = torch.tensor([True, False])
+    env.command_manager = Mock()
+    env.event_manager = Mock(active_terms={})
+    env.video_recorders = []
+    env.extras = {}
+    state = torch.tensor([3.0, 5.0])
+    env.observation_manager = Mock()
+    env.observation_manager.compute.side_effect = lambda **_: {"policy": state.clone()}
+    env._reset_idx = Mock(side_effect=lambda ids: state.index_fill_(0, ids.long(), 0))
+
+    observations, rewards, terminated, truncated, extras = env.step(torch.zeros(2, 0))
+
+    assert rewards.tolist() == [1.0, 0.0]
+    assert terminated.tolist() == [True, manual_reset]
+    assert not truncated.any()
+    assert observations["policy"].tolist() == ([0.0, 5.0] if auto_reset else [3.0, 5.0])
+    assert env.recorder_manager.record_pre_reset.call_count == int(auto_reset)
+    assert env.recorder_manager.record_post_reset.call_count == int(auto_reset)
+    assert env._reset_idx.call_count == int(auto_reset)
+    assert env.sim.render.call_count == (3 if auto_reset else 1)
+    if auto_reset:
+        assert extras["final_obs"]["policy"].tolist() == [3.0, 5.0]
+    else:
+        assert "final_obs" not in extras

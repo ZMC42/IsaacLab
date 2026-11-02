@@ -46,7 +46,8 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
     Note:
         For vectorized environments, it is recommended to **only** call the :meth:`reset`
         method once before the first call to :meth:`step`, i.e. after the environment is created.
-        After that, the :meth:`step` function handles the reset of terminated sub-environments.
+        After that, the :meth:`step` function handles the reset of terminated sub-environments
+        unless :attr:`ManagerBasedRLEnvCfg.auto_reset` is False.
         This is because the simulator does not support resetting individual sub-environments
         in a vectorized environment.
 
@@ -80,6 +81,12 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
 
         # initialize the base class to setup the scene.
         super().__init__(cfg=cfg)
+        self.metadata = {
+            **self.metadata,
+            "autoreset_mode": gym.vector.AutoresetMode.SAME_STEP
+            if cfg.auto_reset
+            else gym.vector.AutoresetMode.DISABLED,
+        }
         # store the render mode
         self.render_mode = render_mode
 
@@ -183,7 +190,7 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         2. Perform physics stepping.
         3. Perform rendering if gui is enabled.
         4. Update the environment counters and compute the rewards and terminations.
-        5. Reset the environments that terminated.
+        5. Reset the environments that terminated when :attr:`ManagerBasedRLEnvCfg.auto_reset` is enabled.
         6. Compute the observations.
         7. Return the observations, rewards, resets and extras.
 
@@ -243,7 +250,7 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
 
         # -- reset envs that terminated/timed-out and log the episode information
         reset_env_ids = self.reset_buf.nonzero(as_tuple=False).squeeze(-1).int()
-        if len(reset_env_ids) > 0:
+        if self.cfg.auto_reset and len(reset_env_ids) > 0:
             # capture the terminal observation before reset and expose it for Same-Step autoreset.
             if self.cfg.compute_final_obs:
                 self.extras["final_obs"] = self.observation_manager.compute()
@@ -266,10 +273,11 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
             if len(manual_reset_ids) > 0:
                 # mark as terminated so RL wrappers observe the episode boundary
                 index_fill_(self.reset_terminated, manual_reset_ids, True)
-                # mirror the recorder lifecycle used for normal resets
-                self.recorder_manager.record_pre_reset(manual_reset_ids)
-                self._reset_idx(manual_reset_ids)
-                self.recorder_manager.record_post_reset(manual_reset_ids)
+                if self.cfg.auto_reset:
+                    # mirror the recorder lifecycle used for normal resets
+                    self.recorder_manager.record_pre_reset(manual_reset_ids)
+                    self._reset_idx(manual_reset_ids)
+                    self.recorder_manager.record_post_reset(manual_reset_ids)
 
         self.command_manager.compute(dt=self.step_dt)
         if "interval" in self.event_manager.active_terms:
@@ -278,7 +286,7 @@ class ManagerBasedRLEnv(ManagerBasedEnv, gym.Env):
         for recorder in self.video_recorders:
             recorder.step()
         # -- compute observations
-        # note: done after reset to get the correct observations for reset envs
+        # With auto_reset disabled these remain observations from the completed episode.
         self.obs_buf = self.observation_manager.compute(update_history=True)
 
         return self.obs_buf, self.reward_buf, self.reset_terminated, self.reset_time_outs, self.extras
