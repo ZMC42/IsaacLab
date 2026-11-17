@@ -45,7 +45,6 @@ dependencies = [
     "gymnasium>=1.2.0",
     "trimesh>=4.6.8",  # lower bound inherited from newton[importers]
     "pyglet>=2.1.6,<3",
-    "transformers==5.10.4",
     "einops",
     "warp-lang==1.17.0",
     "matplotlib>=3.10.3",
@@ -107,6 +106,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+
+# Only the Theia model zoo in mdp.observations.image_features needs Transformers.
+# G1 simulation and external policy clients supply their own model dependencies.
+theia = ["transformers==5.10.4"]
 
 tetrahedralization = ["pytetwild[all]>=0.3.0,<0.4"]
 
